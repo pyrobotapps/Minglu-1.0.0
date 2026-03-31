@@ -2,11 +2,16 @@ import asyncio
 import time
 from typing import Optional
 
+import aiohttp
 import discord
-from discord import app_commands
 from discord.ext import commands
+from discord import app_commands
 
-from config import DISCORD_TOKEN, DATABASE_URL, INTRO_COOLDOWN_SECONDS, BOT_STATUS_TEXT
+from config import (
+    DISCORD_TOKEN,
+    INTRO_COOLDOWN_SECONDS,
+    BOT_STATUS_TEXT,
+)
 from database import (
     connect_db,
     setup_tables,
@@ -16,6 +21,7 @@ from database import (
     get_user_intro,
     upsert_user_intro,
 )
+from translator import translate_text, LANG_CODES
 
 
 def now_ts() -> int:
@@ -40,13 +46,13 @@ def clean_value(value: Optional[str]) -> str:
     return value if value else "N/A"
 
 
-def normalize_link(value: Optional[str]) -> Optional[str]:
-    cleaned = clean_value(value)
-    if cleaned == "N/A":
+def normalize_link(url: str) -> Optional[str]:
+    value = clean_value(url)
+    if value == "N/A":
         return None
-    if not cleaned.startswith(("http://", "https://")):
-        cleaned = f"https://{cleaned}"
-    return cleaned
+    if not value.startswith(("http://", "https://")):
+        value = f"https://{value}"
+    return value
 
 
 def build_intro_embed(
@@ -55,156 +61,197 @@ def build_intro_embed(
     gamertags: str,
     games: str,
     quirks: str,
-    twitch: Optional[str],
-    youtube: Optional[str],
+    twitch: str,
+    youtube: str,
     about: str,
+    cn: str,
+    jp: str,
+    kr: str,
+    th: str,
+    ru: str,
 ) -> discord.Embed:
     lines = [
-        "╭──╯ . . . . . 𝐼𝓃𝓉𝓇𝑜𝒹𝓊𝒸𝓉𝒾𝑜𝓃 . . . . . ╰──╮",
+        "╭──╯ . . . . .𝐼𝓃𝓉𝓇𝑜𝒹𝓊𝒸𝓉𝒾𝑜𝓃. . . . . ╰──╮",
         "",
         f"/ᐠ - ˕ -マ ⛧ {name} ⛧",
         "",
         "╭∪─∪───────────────",
-        f"┊ 🎮 Gamertag(s): {gamertags}",
-        f"┊ 🎯 Games: {games}",
+        f"┊ Gamertag(s): {gamertags}",
+        f"┊ Games: {games}",
         f"┊ ✨ Quirks: {quirks}",
         "╰──────────────────",
         "",
-        "⊹ ࣪ ﹏𓊝﹏𓂁﹏⊹ ࣪ ˖",
+        "⊹ ࣪ ﹏﹏﹏⊹ ࣪ ˖",
         "",
     ]
 
-    social_lines = []
     twitch_url = normalize_link(twitch)
     youtube_url = normalize_link(youtube)
 
-    if twitch_url:
-        social_lines.append(f"📺 Twitch: [🟣 twitch]({twitch_url})")
-    if youtube_url:
-        social_lines.append(f"📹 YouTube: [🔴 YouTube]({youtube_url})")
-
-    if social_lines:
-        lines.extend(social_lines)
+    if twitch_url or youtube_url:
+        if twitch_url:
+            lines.append(f"📺 Twitch: [🟣 twitch]({twitch_url})")
+        if youtube_url:
+            lines.append(f"📹 YouTube: [🔴 YouTube]({youtube_url})")
         lines.append("")
 
-    lines.extend(
-        [
-            "╭──╯ . . . 𝒜𝒷ℴ𝓊𝓉 ℳℯ . . . ╰──╮",
-            f"ღ {about} ღ",
-            "╰──────────────────────",
-        ]
-    )
+    lines.extend([
+        "╭──╯ . . . ℴ ℳℯ . . . ╰──╮",
+        f"ღ {about} ღ",
+        "╰──────────────────────",
+        "",
+        "Translations",
+        "",
+        f"中文:\n{cn}",
+        "",
+        f"日本語:\n{jp}",
+        "",
+        f"한국어:\n{kr}",
+        "",
+        f"ไทย:\n{th}",
+        "",
+        f"Русский:\n{ru}",
+    ])
 
     embed = discord.Embed(
-        color=discord.Color.from_str("#D4AF37"),
-        description="\n".join(lines),
+        color=0xD4AF37,
+        description="\n".join(lines)
     )
-    embed.set_author(name=user.display_name, icon_url=user.display_avatar.url)
+    embed.set_author(
+        name=user.display_name if isinstance(user, discord.Member) else user.name,
+        icon_url=user.display_avatar.url
+    )
     embed.set_thumbnail(url=user.display_avatar.url)
-    embed.set_footer(text="🏮 A new legend enters the Jianghu")
+    embed.set_footer(text="Recorded by Minglu")
     return embed
 
 
-class IntroModalPageOne(discord.ui.Modal, title="Jianghu Introduction"):
+async def send_intro_panel(channel: discord.TextChannel) -> discord.Message:
+    embed = discord.Embed(
+        title="Minglu • 名录",
+        description=(
+            "Step forward and record your name in the Jianghu.\n\n"
+            "Click the button below to introduce yourself.\n"
+            "You may submit a new introduction once every 7 days.\n"
+            "Your previous introduction will be automatically replaced."
+        ),
+        color=0xD4AF37
+    )
+    return await channel.send(embed=embed, view=IntroPanelView())
+
+
+class IntroPanelView(discord.ui.View):
     def __init__(self):
-        super().__init__(timeout=300)
+        super().__init__(timeout=None)
 
-        self.name_input = discord.ui.TextInput(
-            label="Name",
-            max_length=100,
-            required=True,
-        )
-        self.gamertags_input = discord.ui.TextInput(
-            label="Gamertag(s)",
-            max_length=200,
-            required=True,
-        )
-        self.games_input = discord.ui.TextInput(
-            label="Games",
-            max_length=200,
-            required=True,
-        )
-        self.twitch_input = discord.ui.TextInput(
-            label="Twitch (optional)",
-            max_length=200,
-            required=False,
-            placeholder="N/A",
-        )
-        self.youtube_input = discord.ui.TextInput(
-            label="YouTube (optional)",
-            max_length=200,
-            required=False,
-            placeholder="N/A",
-        )
-
-        self.add_item(self.name_input)
-        self.add_item(self.gamertags_input)
-        self.add_item(self.games_input)
-        self.add_item(self.twitch_input)
-        self.add_item(self.youtube_input)
-
-    async def on_submit(self, interaction: discord.Interaction) -> None:
-        modal = IntroModalPageTwo(
-            name=self.name_input.value,
-            gamertags=self.gamertags_input.value,
-            games=self.games_input.value,
-            twitch=self.twitch_input.value,
-            youtube=self.youtube_input.value,
-        )
-        await interaction.response.send_modal(modal)
-
-
-class IntroModalPageTwo(discord.ui.Modal, title="Jianghu Introduction"):
-    def __init__(self, name: str, gamertags: str, games: str, twitch: str, youtube: str):
-        super().__init__(timeout=300)
-        self.saved_name = name
-        self.saved_gamertags = gamertags
-        self.saved_games = games
-        self.saved_twitch = twitch
-        self.saved_youtube = youtube
-
-        self.quirks_input = discord.ui.TextInput(
-            label="Quirks",
-            max_length=200,
-            required=True,
-        )
-        self.about_input = discord.ui.TextInput(
-            label="About Me (optional)",
-            style=discord.TextStyle.paragraph,
-            max_length=1000,
-            required=False,
-            placeholder="N/A",
-        )
-
-        self.add_item(self.quirks_input)
-        self.add_item(self.about_input)
-
-    async def on_submit(self, interaction: discord.Interaction) -> None:
+    @discord.ui.button(
+        label="Record Your Name",
+        style=discord.ButtonStyle.primary,
+        custom_id="minglu:intro:start"
+    )
+    async def start_intro(self, interaction: discord.Interaction, _: discord.ui.Button):
+        existing = await get_user_intro(interaction.user.id, interaction.guild.id)
         current = now_ts()
 
-        settings = await get_intro_settings(interaction.guild.id)
+        if existing:
+            remaining = INTRO_COOLDOWN_SECONDS - (current - int(existing["last_used"]))
+            if remaining > 0:
+                return await interaction.response.send_message(
+                    f"🏮 The Minglu remembers your name.\n\n"
+                    f"You may submit another introduction in **{format_remaining(remaining)}**.",
+                    ephemeral=True
+                )
+
+        await interaction.response.send_modal(IntroModalPageOne())
+
+
+class IntroModalPageOne(discord.ui.Modal, title="Minglu Introduction • Page 1"):
+    name = discord.ui.TextInput(label="Name", max_length=100)
+    gamertags = discord.ui.TextInput(label="Gamertag(s)", max_length=200)
+    games = discord.ui.TextInput(label="Games", max_length=200)
+    twitch = discord.ui.TextInput(
+        label="Twitch (optional)",
+        required=False,
+        max_length=200,
+        placeholder="N/A"
+    )
+    youtube = discord.ui.TextInput(
+        label="YouTube (optional)",
+        required=False,
+        max_length=200,
+        placeholder="N/A"
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        payload = {
+            "name": str(self.name),
+            "gamertags": str(self.gamertags),
+            "games": str(self.games),
+            "twitch": str(self.twitch),
+            "youtube": str(self.youtube),
+        }
+        await interaction.response.send_modal(IntroModalPageTwo(payload))
+
+
+class IntroModalPageTwo(discord.ui.Modal, title="Minglu Introduction • Page 2"):
+    quirks = discord.ui.TextInput(label="Quirks", max_length=200)
+    about = discord.ui.TextInput(
+        label="About Me (optional)",
+        required=False,
+        style=discord.TextStyle.paragraph,
+        max_length=1000,
+        placeholder="N/A"
+    )
+
+    def __init__(self, payload: dict):
+        super().__init__()
+        self.payload = payload
+
+    async def on_submit(self, interaction: discord.Interaction):
+        settings = await get_intro_settings(interaction.guild.id if interaction.guild else 0)
         if not settings:
             return await interaction.response.send_message(
-                "The introduction system has not been set up yet.",
-                ephemeral=True,
+                "Minglu has not been set up in this server yet.\nRun `/intro setup` first.",
+                ephemeral=True
             )
 
         intro_channel = interaction.guild.get_channel(int(settings["intro_channel_id"]))
         if not isinstance(intro_channel, discord.TextChannel):
             return await interaction.response.send_message(
-                "The introduction channel is invalid.",
-                ephemeral=True,
+                "The introduction channel is not configured correctly.",
+                ephemeral=True
             )
 
         existing = await get_user_intro(interaction.user.id, interaction.guild.id)
+        current = now_ts()
+
         if existing:
             remaining = INTRO_COOLDOWN_SECONDS - (current - int(existing["last_used"]))
             if remaining > 0:
                 return await interaction.response.send_message(
-                    f"🏮 The Jianghu remembers your name.\n\n"
-                    f"You may submit another introduction in {format_remaining(remaining)}.",
-                    ephemeral=True,
+                    f"🏮 The Minglu remembers your name.\n\n"
+                    f"You may submit another introduction in **{format_remaining(remaining)}**.",
+                    ephemeral=True
                 )
+
+        name = clean_value(self.payload["name"])
+        gamertags = clean_value(self.payload["gamertags"])
+        games = clean_value(self.payload["games"])
+        quirks = clean_value(str(self.quirks))
+        about = clean_value(str(self.about))
+        twitch = self.payload["twitch"]
+        youtube = self.payload["youtube"]
+
+        text_to_translate = f"Quirks: {quirks}\nAbout Me: {about}"
+
+        async with aiohttp.ClientSession() as session:
+            cn, jp, kr, th, ru = await asyncio.gather(
+                translate_text(session, text_to_translate, LANG_CODES["zh"]),
+                translate_text(session, text_to_translate, LANG_CODES["ja"]),
+                translate_text(session, text_to_translate, LANG_CODES["ko"]),
+                translate_text(session, text_to_translate, LANG_CODES["th"]),
+                translate_text(session, text_to_translate, LANG_CODES["ru"]),
+            )
 
         if existing:
             try:
@@ -217,18 +264,23 @@ class IntroModalPageTwo(discord.ui.Modal, title="Jianghu Introduction"):
 
         embed = build_intro_embed(
             user=interaction.user,
-            name=clean_value(self.saved_name),
-            gamertags=clean_value(self.saved_gamertags),
-            games=clean_value(self.saved_games),
-            quirks=clean_value(self.quirks_input.value),
-            twitch=self.saved_twitch,
-            youtube=self.saved_youtube,
-            about=clean_value(self.about_input.value),
+            name=name,
+            gamertags=gamertags,
+            games=games,
+            quirks=quirks,
+            twitch=twitch,
+            youtube=youtube,
+            about=about,
+            cn=cn,
+            jp=jp,
+            kr=kr,
+            th=th,
+            ru=ru,
         )
 
         sent = await intro_channel.send(embed=embed)
 
-        # move panel after every successful introduction
+        # move panel after each successful introduction
         if interaction.guild.id not in interaction.client.repost_locks:
             interaction.client.repost_locks.add(interaction.guild.id)
             try:
@@ -255,76 +307,27 @@ class IntroModalPageTwo(discord.ui.Modal, title="Jianghu Introduction"):
         )
 
         await interaction.response.send_message(
-            "🏮 Your introduction has been recorded in the Jianghu.",
-            ephemeral=True,
+            "Your name has been recorded in the Minglu.",
+            ephemeral=True
         )
-
-
-class IntroPanelView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-
-    @discord.ui.button(
-        label="Introduce Yourself",
-        style=discord.ButtonStyle.primary,
-        custom_id="intro_button",
-    )
-    async def introduce_yourself(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button,
-    ) -> None:
-        existing = await get_user_intro(interaction.user.id, interaction.guild.id)
-        if existing:
-            remaining = INTRO_COOLDOWN_SECONDS - (now_ts() - int(existing["last_used"]))
-            if remaining > 0:
-                return await interaction.response.send_message(
-                    f"🏮 The Jianghu remembers your name.\n\n"
-                    f"You may submit another introduction in {format_remaining(remaining)}.",
-                    ephemeral=True,
-                )
-
-        await interaction.response.send_modal(IntroModalPageOne())
-
-
-async def send_intro_panel(channel: discord.TextChannel) -> discord.Message:
-    embed = discord.Embed(
-        title="🏮 New User Introductions",
-        description=(
-            "Step forward and share your story with the Jianghu.\n\n"
-            "Click the button below to introduce yourself.\n"
-            "You may submit a new introduction once every 7 days.\n"
-            "Your previous introduction will be automatically replaced."
-        ),
-        color=discord.Color.from_str("#D4AF37"),
-    )
-
-    return await channel.send(embed=embed, view=IntroPanelView())
-
-
-intents = discord.Intents.default()
-intents.guilds = True
-intents.message_content = True
-
-bot = commands.Bot(command_prefix="!", intents=intents)
-bot.repost_locks = set()
 
 
 class IntroGroup(app_commands.Group):
     def __init__(self):
-        super().__init__(name="intro", description="Introduction system commands")
+        super().__init__(name="intro", description="Minglu intro system")
 
-    @app_commands.command(name="setup", description="Set the introduction channel and post the panel")
+    @app_commands.command(name="setup", description="Set up Minglu in a channel")
+    @app_commands.describe(channel="Channel for introductions and the intro panel")
     @app_commands.checks.has_permissions(administrator=True)
     async def setup(self, interaction: discord.Interaction, channel: discord.TextChannel):
-        settings = await get_intro_settings(interaction.guild.id)
+        old_settings = await get_intro_settings(interaction.guild.id)
 
-        if settings and settings["panel_message_id"]:
+        if old_settings and old_settings["panel_message_id"]:
             try:
-                old_channel = interaction.guild.get_channel(int(settings["intro_channel_id"]))
+                old_channel = interaction.guild.get_channel(int(old_settings["intro_channel_id"]))
                 if isinstance(old_channel, discord.TextChannel):
-                    old_panel = await old_channel.fetch_message(int(settings["panel_message_id"]))
-                    await old_panel.delete()
+                    old_message = await old_channel.fetch_message(int(old_settings["panel_message_id"]))
+                    await old_message.delete()
             except Exception:
                 pass
 
@@ -338,50 +341,43 @@ class IntroGroup(app_commands.Group):
         )
 
         await interaction.response.send_message(
-            f"Introduction setup complete in {channel.mention}.",
-            ephemeral=True,
+            f"Minglu has been set up in {channel.mention}.",
+            ephemeral=True
         )
 
 
-bot.tree.add_command(IntroGroup())
+class MingiBot(commands.Bot):
+    def __init__(self):
+        intents = discord.Intents.default()
+        intents.message_content = True
+        super().__init__(command_prefix="!", intents=intents)
+        self.repost_locks: set[int] = set()
+
+    async def setup_hook(self):
+        await connect_db()
+        await setup_tables()
+        self.add_view(IntroPanelView())
+        self.tree.add_command(IntroGroup())
+        await self.tree.sync()
+
+
+bot = MingiBot()
 
 
 @bot.event
 async def on_ready():
-    await connect_db(DATABASE_URL)
-    await setup_tables()
-    bot.add_view(IntroPanelView())
-
-    try:
-        synced = await bot.tree.sync()
-        print(f"Synced {len(synced)} command(s).")
-    except Exception as exc:
-        print(f"Failed to sync commands: {exc}")
-
-    await bot.change_presence(activity=discord.Game(name=BOT_STATUS_TEXT))
-    print(f"Logged in as {bot.user} ({bot.user.id})")
+    await bot.change_presence(
+        activity=discord.Activity(
+            type=discord.ActivityType.watching,
+            name=BOT_STATUS_TEXT
+        )
+    )
+    print(f"Logged in as {bot.user}")
 
 
 @bot.event
 async def on_message(message: discord.Message):
     await bot.process_commands(message)
-
-
-async def keep_database_awake():
-    while True:
-        try:
-            from database import get_pool
-            pool = get_pool()
-            async with pool.acquire() as conn:
-                await conn.execute("SELECT 1;")
-        except Exception as exc:
-            print(f"Database keep-alive failed: {exc}")
-        await asyncio.sleep(240)
-
-
-@bot.event
-async def setup_hook():
-    bot.loop.create_task(keep_database_awake())
 
 
 bot.run(DISCORD_TOKEN)

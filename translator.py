@@ -14,6 +14,9 @@ async def translate_text(session: aiohttp.ClientSession, text: str, target_lang:
     if not text or not text.strip():
         return "N/A"
 
+    if not AZURE_KEY or not AZURE_ENDPOINT or not AZURE_REGION:
+        return text
+
     url = f"{AZURE_ENDPOINT}/translate?api-version=3.0&to={target_lang}"
     headers = {
         "Ocp-Apim-Subscription-Key": AZURE_KEY,
